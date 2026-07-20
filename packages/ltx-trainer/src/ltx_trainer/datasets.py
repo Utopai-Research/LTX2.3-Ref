@@ -290,7 +290,11 @@ class PrecomputedDataset(Dataset):
         Normalize video latents to non-patchified format [C, F, H, W].
         Used for keeping backward compatibility with legacy datasets.
         """
-        latents = data["latents"]
+        # Bucketed reference latents (v2) carry no "latents" key (they store ref_tokens/image_grids)
+        # and aren't legacy 2-D video latents -> pass through untouched.
+        latents = data.get("latents")
+        if latents is None:
+            return data
 
         # Check if latents are in legacy patchified format [seq_len, C]
         if latents.dim() == 2:

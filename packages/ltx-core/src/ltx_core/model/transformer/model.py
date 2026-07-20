@@ -1,3 +1,5 @@
+import math
+from dataclasses import replace
 from enum import Enum
 
 import torch
@@ -19,6 +21,18 @@ from ltx_core.model.transformer.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from ltx_core.utils import to_denoised
+
+
+def _build_sinusoidal_slot_table(n_slots: int, dim: int) -> torch.Tensor:
+    """Fixed sinusoidal identity table, shape (n_slots + 1, dim). Rows 0..n_slots-1 encode the
+    reference-image slot index; the last row (padding index) is zero so non-reference tokens
+    get a zero add. dim is assumed even (inner_dim)."""
+    table = torch.zeros(n_slots + 1, dim)
+    pos = torch.arange(n_slots, dtype=torch.float32).unsqueeze(1)
+    div = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim))
+    table[:n_slots, 0::2] = torch.sin(pos * div)
+    table[:n_slots, 1::2] = torch.cos(pos * div)
+    return table
 
 
 class LTXModelType(Enum):
@@ -68,8 +82,12 @@ class LTXModel(torch.nn.Module):
         caption_projection: torch.nn.Module | None = None,
         audio_caption_projection: torch.nn.Module | None = None,
         cross_attention_adaln: bool = False,
+        num_reference_slots: int = 0,
+        reference_embedding_type: str = "learned",
     ):
         super().__init__()
+        self.num_reference_slots = num_reference_slots
+        self.reference_embedding_type = reference_embedding_type
         self._enable_gradient_checkpointing = False
         self.cross_attention_adaln = cross_attention_adaln
         self.use_middle_indices_grid = use_middle_indices_grid
@@ -91,6 +109,11 @@ class LTXModel(torch.nn.Module):
                 norm_eps=norm_eps,
                 caption_projection=caption_projection,
             )
+            # Reference-image identity embedding (additive). Created now if requested at construction
+            # (num_reference_slots > 0); can also be turned on after loading a base checkpoint via
+            # enable_reference_embedding() (used by the trainer for the reference_images strategy).
+            self.reference_slot_embedding = None
+            self.enable_reference_embedding(num_reference_slots, reference_embedding_type)
 
         if model_type.is_audio_enabled():
             if audio_positional_embedding_max_pos is None:
@@ -409,6 +432,38 @@ class LTXModel(torch.nn.Module):
         x = proj_out(x)
         return x
 
+    def enable_reference_embedding(self, num_reference_slots: int, reference_embedding_type: str = "learned") -> None:
+        """Create the per-reference-image identity embedding (additive, hidden space). Idempotent and
+        safe to call after loading a base checkpoint (cast to the model's current device/dtype).
+        num_reference_slots == 0 disables it (both stores None)."""
+        self.num_reference_slots = num_reference_slots
+        self.reference_embedding_type = reference_embedding_type
+        self.reference_slot_embedding = None
+        if hasattr(self, "reference_slot_embedding_table"):
+            del self.reference_slot_embedding_table  # allow re-enable
+        if num_reference_slots <= 0:
+            return
+        ref_param = next(self.parameters())  # match the model's current device/dtype
+        if reference_embedding_type == "learned":
+            emb = torch.nn.Embedding(num_reference_slots + 1, self.inner_dim, padding_idx=num_reference_slots)
+            self.reference_slot_embedding = emb.to(device=ref_param.device, dtype=ref_param.dtype)
+        elif reference_embedding_type == "sinusoidal":
+            table = _build_sinusoidal_slot_table(num_reference_slots, self.inner_dim).to(
+                device=ref_param.device, dtype=ref_param.dtype
+            )
+            self.register_buffer("reference_slot_embedding_table", table, persistent=False)
+        else:
+            raise ValueError(f"Unknown reference_embedding_type: {reference_embedding_type!r}")
+
+    def _reference_slot_embeds(self, slot_ids: torch.Tensor) -> torch.Tensor | None:
+        """Per-token reference-image identity embedding (learned or sinusoidal); None if off."""
+        if self.reference_slot_embedding is not None:
+            return self.reference_slot_embedding(slot_ids)
+        table = getattr(self, "reference_slot_embedding_table", None)
+        if table is not None:
+            return table[slot_ids]
+        return None
+
     def forward(
         self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -423,6 +478,12 @@ class LTXModel(torch.nn.Module):
             raise ValueError("Audio is not enabled for this model")
 
         video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
+        # Add the learned per-reference-image identity embedding (additive, hidden space) to the
+        # reference tokens; non-reference tokens index the padding row -> zero add. Off (None) by default.
+        if video_args is not None and video is not None and video.reference_slot_ids is not None:
+            slot_embed = self._reference_slot_embeds(video.reference_slot_ids.to(device=video_args.x.device))
+            if slot_embed is not None:
+                video_args = replace(video_args, x=video_args.x + slot_embed.to(video_args.x.dtype))
         audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(

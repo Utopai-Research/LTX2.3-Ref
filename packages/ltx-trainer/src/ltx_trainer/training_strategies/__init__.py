@@ -13,16 +13,19 @@ from ltx_trainer.training_strategies.base_strategy import (
     TrainingStrategy,
     TrainingStrategyConfigBase,
 )
+from ltx_trainer.training_strategies.reference_images import ReferenceImagesConfig, ReferenceImagesStrategy
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig, TextToVideoStrategy
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig, VideoToVideoStrategy
 
 # Type alias for all strategy config types
-TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig
+TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | ReferenceImagesConfig
 
 __all__ = [
     "DEFAULT_FPS",
     "VIDEO_SCALE_FACTORS",
     "ModelInputs",
+    "ReferenceImagesConfig",
+    "ReferenceImagesStrategy",
     "TextToVideoConfig",
     "TextToVideoStrategy",
     "TrainingStrategy",
@@ -50,6 +53,8 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
             strategy = TextToVideoStrategy(config)
         case VideoToVideoConfig():
             strategy = VideoToVideoStrategy(config)
+        case ReferenceImagesConfig():
+            strategy = ReferenceImagesStrategy(config)
         case _:
             raise ValueError(f"Unknown training strategy config type: {type(config).__name__}")
 

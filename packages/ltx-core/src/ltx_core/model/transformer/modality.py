@@ -53,6 +53,11 @@ class Modality:
     enabled: bool = True
     context_mask: torch.Tensor | None = None
     attention_mask: torch.Tensor | None = None
+    # Per-token reference-image slot index, shape (B, T), int64. Each in-context reference
+    # image's tokens carry that image's slot id; non-reference (target) tokens carry the
+    # padding index. Consumed by LTXModel's reference_slot_embedding (additive identity PE).
+    # None means no reference-image conditioning -> existing behavior is unchanged.
+    reference_slot_ids: torch.Tensor | None = None
 
     def split(self, sizes: list[int]) -> list[Modality]:
         """Split along the batch dimension into chunks of the given sizes."""

@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, Validatio
 
 from ltx_trainer.quantization import QuantizationOptions
 from ltx_trainer.training_strategies.base_strategy import TrainingStrategyConfigBase
+from ltx_trainer.training_strategies.reference_images import ReferenceImagesConfig
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig
 
@@ -89,7 +90,9 @@ def _get_strategy_discriminator(v: dict | TrainingStrategyConfigBase) -> str:
 
 # Union type for all strategy configs with discriminator
 TrainingStrategyConfig = Annotated[
-    Annotated[TextToVideoConfig, Tag("text_to_video")] | Annotated[VideoToVideoConfig, Tag("video_to_video")],
+    Annotated[TextToVideoConfig, Tag("text_to_video")]
+    | Annotated[VideoToVideoConfig, Tag("video_to_video")]
+    | Annotated[ReferenceImagesConfig, Tag("reference_images")],
     Discriminator(_get_strategy_discriminator),
 ]
 

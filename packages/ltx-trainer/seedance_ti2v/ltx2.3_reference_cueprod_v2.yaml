@@ -1,0 +1,89 @@
+# =============================================================================
+# cue_prod v2 (HIRES) — 4-NODE FULL FT on the LARGE dataset (~13.4k clips, ~5.4x).
+# =============================================================================
+# SAME recipe as the seedance_video_v0 v2 4-node run (exp2e: learned identity embed,
+# shared ref-time -1.0, reference_dropout_p 0.1, lr 2e-5 for global batch 32, constant
+# LR, audio on) — the ONLY change is the data root: the cue_prod precompute (16:9 +
+# 720p/1080p, 1280x704 video + aspect-bucketed refs). Fresh from base.
+# =============================================================================
+
+model:
+  model_path: "/home/zheng/videogen/checkpoints/LTX-2.3/ltx-2.3-22b-dev.safetensors"
+  text_encoder_path: "/home/zheng/videogen/checkpoints/gemma-3-12b-it-qat-q4_0-unquantized"
+  training_mode: "full"
+  load_checkpoint: null
+
+lora: null
+
+training_strategy:
+  name: "reference_images"
+  reference_latents_dir: "reference_image_latents"
+  max_reference_slots: 9
+  reference_time_constant: -1.0
+  reference_embedding_type: "learned"
+  reference_dropout_p: 0.1
+  reference_image_dropout_p: 0.0
+  first_frame_conditioning_p: 0.0
+  with_audio: true
+  audio_latents_dir: "audio_latents"
+
+optimization:
+  learning_rate: 2.0e-5          # sqrt(4) x single-node 1e-5 for the 4x global batch (32)
+  steps: 50000                   # high cap; constant LR -> pick best ckpt offline
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "constant"
+  scheduler_params: {}
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: null
+  load_text_encoder_in_8bit: false
+  offload_optimizer_during_validation: false
+
+data:
+  preprocessed_data_root: "/home/zheng/seedance_cue_prod/.precomputed_ti2v_16x9_v2"
+  num_dataloader_workers: 4
+
+validation:
+  interval: null
+  prompts: []
+  negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
+  images: null
+  video_dims: [1280, 704, 121]
+  frame_rate: 24.0
+  seed: 42
+  inference_steps: 30
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_av"
+  generate_audio: false
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 500
+  keep_last_n: -1
+  precision: "bfloat16"
+  save_training_state: "minimal"
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "ltx2.3-seedance-ref"
+  entity: null
+  tags: ["ltx2.3", "reference", "full", "seedance", "dropout", "v2", "hires", "4node", "cueprod", "large-dataset"]
+  log_validation_videos: true
+
+seed: 42
+output_dir: "/home/zheng/seedance_video_v0/runs/ltx2.3_reference_cueprod_v2"

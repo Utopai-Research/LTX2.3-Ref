@@ -1,4 +1,5 @@
 import contextlib
+import json
 import math
 import os
 import re
@@ -59,8 +60,8 @@ warnings.filterwarnings(
     "ignore", message="MatMul8bitLt: inputs will be cast from torch.bfloat16 to float16 during quantization"
 )
 
-# Disable progress bars if not main process
-IS_MAIN_PROCESS = os.environ.get("LOCAL_RANK", "0") == "0"
+# Disable progress bars if not global main process.
+IS_MAIN_PROCESS = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) == "0"
 if not IS_MAIN_PROCESS:
     from transformers.utils.logging import disable_progress_bar
 
@@ -133,7 +134,12 @@ class LtxvTrainer:
         initial_step, training_state = self._resume_state
         resuming = training_state is not None
 
-        set_seed(cfg.seed)
+        # device_specific=True offsets the seed by process_index. With identical per-rank seeds,
+        # every rank draws the SAME per-sample randomness (condition dropout, sigmas, noise)
+        # whenever cumulative RNG consumption happens to align, turning i.i.d. per-sample draws
+        # into synchronized per-step bursts across the world. Dataloader shuffle order is
+        # unaffected: Accelerate broadcast-syncs the sampler generator each epoch.
+        set_seed(cfg.seed, device_specific=True)
         logger.debug(f"Process {self._accelerator.process_index} using seed: {cfg.seed}")
 
         self._init_optimizer()
@@ -484,6 +490,16 @@ class LtxvTrainer:
         transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
         self._transformer = self._transformer.to(dtype=transformer_dtype)
 
+        # Reference-image conditioning: create the per-image identity embedding on the (base)
+        # transformer before LoRA wrapping. It's frozen by the freeze below + PEFT, then re-enabled
+        # as trainable in _collect_trainable_params.
+        if self._config.training_strategy.name == "reference_images":
+            strat = self._config.training_strategy
+            # use_identity_embedding=False (exp2c) -> 0 slots disables the embedding entirely
+            # (identity is then carried by per-image RoPE time only).
+            num_slots = strat.max_reference_slots if getattr(strat, "use_identity_embedding", True) else 0
+            self._transformer.enable_reference_embedding(num_slots, strat.reference_embedding_type)
+
         if self._config.acceleration.quantization is not None:
             if self._config.model.training_mode == "full":
                 raise ValueError("Quantization is not supported in full training mode.")
@@ -515,6 +531,12 @@ class LtxvTrainer:
             self._transformer.requires_grad_(True)
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
+
+        # The reference-image identity embedding is a base-model module that PEFT (LoRA) and the
+        # explicit freeze leave frozen; re-enable grad so it trains alongside the LoRA (no-op if off).
+        for name, param in self._transformer.named_parameters():
+            if "reference_slot_embedding" in name:
+                param.requires_grad_(True)
 
         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
@@ -561,8 +583,16 @@ class LtxvTrainer:
         self._resume_state = self._resolve_resume_state()
 
     def _load_full_checkpoint(self, checkpoint_path: Path) -> None:
-        """Load full model checkpoint."""
-        state_dict = load_file(checkpoint_path)
+        """Load full model checkpoint.
+
+        Full-FT checkpoints are written by ``accelerator.save`` (torch.save / zip format) despite the
+        ``.safetensors`` extension (see ``_save_checkpoint``), so load with ``torch.load`` to match.
+        Fall back to safetensors for any genuinely safetensors-format full checkpoint.
+        """
+        try:
+            state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        except Exception:
+            state_dict = load_file(checkpoint_path)
         self._transformer.load_state_dict(state_dict, strict=True)
 
         logger.info("✅ Full model checkpoint loaded successfully")
@@ -575,9 +605,18 @@ class LtxvTrainer:
         # (Weights are saved in ComfyUI-compatible format, with "diffusion_model." prefix)
         state_dict = {k.replace("diffusion_model.", "", 1): v for k, v in state_dict.items()}
 
+        # The reference-image identity embedding is a base-model param (not a LoRA adapter):
+        # split it out and load it directly onto the base module after the LoRA load.
+        ref_emb = state_dict.pop("reference_slot_embedding.weight", None)
+
         # Load LoRA weights and verify all weights were loaded
         base_model = self._transformer.get_base_model()
         set_peft_model_state_dict(base_model, state_dict)
+        if ref_emb is not None and getattr(base_model, "reference_slot_embedding", None) is not None:
+            with torch.no_grad():
+                base_model.reference_slot_embedding.weight.copy_(
+                    ref_emb.to(base_model.reference_slot_embedding.weight)
+                )
 
         logger.info("✅ LoRA checkpoint loaded successfully")
 
@@ -1128,6 +1167,12 @@ class LtxvTrainer:
             # Convert to ComfyUI-compatible format (add "diffusion_model." prefix)
             state_dict = {f"diffusion_model.{k}": v for k, v in state_dict.items()}
 
+            # The reference-image identity embedding is a base-model param (not a LoRA adapter),
+            # so add it explicitly from the gathered full state dict.
+            for k, v in full_state_dict.items():
+                if k.endswith("reference_slot_embedding.weight"):
+                    state_dict["diffusion_model.reference_slot_embedding.weight"] = v
+
             # Cast to configured precision
             state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in state_dict.items()}
 
@@ -1142,6 +1187,14 @@ class LtxvTrainer:
 
             # Save to disk
             self._accelerator.save(full_state_dict, saved_weights_path)
+
+            # accelerator.save is a torch.save snapshot and cannot carry safetensors-style
+            # metadata, so strategy metadata (e.g. reference-dropout settings that downstream
+            # inference needs) goes in a JSON sidecar next to the weights.
+            metadata = self._build_checkpoint_metadata()
+            if metadata:
+                sidecar_path = saved_weights_path.with_suffix(".metadata.json")
+                sidecar_path.write_text(json.dumps(metadata, indent=2))
 
         rel_path = saved_weights_path.relative_to(self._config.output_dir)
         logger.info(f"💾 {prefix.capitalize()} weights for step {self._global_step} saved in {rel_path}")
@@ -1161,6 +1214,9 @@ class LtxvTrainer:
                 if old_checkpoint.exists():
                     old_checkpoint.unlink()
                     logger.info(f"Removed old checkpoint: {old_checkpoint}")
+                old_sidecar = old_checkpoint.with_suffix(".metadata.json")
+                if old_sidecar.exists():
+                    old_sidecar.unlink()
             self._checkpoint_paths = self._checkpoint_paths[-self._config.checkpoints.keep_last_n :]
 
     def _save_training_state(self, save_dir: Path) -> None:

@@ -87,6 +87,22 @@ class GenerationConfig:
     condition_image: Tensor | None = None  # Optional first frame image for image-to-video
     reference_video: Tensor | None = None  # For IC-LoRA: [F, C, H, W] in [0, 1]
     reference_downscale_factor: int = 1  # For IC-LoRA: downscale factor (1 = same resolution, 2 = half resolution)
+    # exp2 reference-IMAGE conditioning: list of K reference images, each [C, H, W] in [0, 1].
+    reference_images: list[Tensor] | None = None
+    reference_slot_count: int = 9  # exp2: max_reference_slots (== identity-embedding padding index)
+    reference_time_constant: float = -1.0  # exp2: fixed RoPE time coordinate for all reference tokens
+    reference_resolution: int = 512  # exp2: square px each reference image is encoded at (MUST match training)
+    # exp2 v2: aspect-bucket each ref image (16:9->1376x768, 9:16->768x1376, other->768x768) instead of the
+    # fixed square crop above. MUST match training (process_reference_images.py REF_BUCKETS). Buckets differ in
+    # size, so per-image token counts vary and images are encoded individually.
+    reference_bucketed: bool = False
+    # exp2c/d PE ablations: image-k RoPE time = base + step*k instead of the shared constant (MUST match training).
+    reference_time_per_image: bool = False
+    reference_time_base: float = 20.0
+    reference_time_step: float = 1.0
+    # Reference CFG (needs a dropout-trained model for a calibrated ref-less branch; see exp2e):
+    # pred += (scale-1) * (cond_with_refs - cond_without_refs) on the target tokens. 1.0 = off.
+    ref_guidance_scale: float = 1.0
     generate_audio: bool = True  # Whether to generate audio alongside video
     include_reference_in_output: bool = False  # For IC-LoRA: concatenate original reference with generated output
     cached_embeddings: CachedPromptEmbeddings | None = None  # Pre-computed text embeddings (avoids loading Gemma)
@@ -175,6 +191,8 @@ class ValidationSampler:
         self._validate_config(config)
 
         # Route to appropriate generation method
+        if config.reference_images is not None:
+            return self._generate_with_reference_images(config, device)
         if config.reference_video is not None:
             return self._generate_with_reference(config, device)
         return self._generate_standard(config, device)
@@ -295,7 +313,7 @@ class ValidationSampler:
         )
         audio_state = noiser(latent_state=audio_clean_state, noise_scale=1.0) if audio_clean_state else None
 
-        # Run denoising loop
+        # Run denoising loop (ref_seq_len enables reference CFG for the IC-LoRA path too)
         combined_state, audio_state = self._run_denoising(
             config=config,
             video_state=combined_state,
@@ -307,6 +325,7 @@ class ValidationSampler:
             v_ctx_neg=v_ctx_neg,
             a_ctx_neg=a_ctx_neg,
             device=device,
+            video_ref_seq_len=ref_seq_len,
         )
 
         # Extract target portion and decode
@@ -330,6 +349,158 @@ class ValidationSampler:
             audio_output = self._decode_audio(audio_state, device)
 
         return video_output, audio_output
+
+    def _generate_with_reference_images(
+        self, config: GenerationConfig, device: torch.device
+    ) -> tuple[Tensor, Tensor | None]:
+        """exp2: generate conditioned on K reference images (no first frame).
+
+        Mirrors the `reference_images` training strategy at inference time:
+        - each reference image is VAE-encoded (at reference_resolution, center-crop) and patchified,
+          then concatenated IN-CONTEXT before the target video tokens (clean, denoise_mask=0),
+        - spatial RoPE per image + time pinned to reference_time_constant,
+        - per-token reference_slot_ids (image-k -> k, target -> padding) drive the identity embedding,
+        - only the target portion is denoised and decoded. Audio (if enabled) is generated jointly.
+        """
+        v_ctx_pos, a_ctx_pos, v_ctx_neg, a_ctx_neg = self._get_prompt_embeddings(config, device)
+        generator = torch.Generator(device=device).manual_seed(config.seed)
+
+        # Encode reference images -> in-context tokens + positions + slot ids
+        ref_tokens, ref_positions, ref_slot_ids, ref_seq_len = self._encode_reference_images(
+            config.reference_images, config, device
+        )
+
+        # Target video state (text + reference conditioned; NO first frame)
+        video_tools = self._create_video_latent_tools(config)
+        target_clean_state = video_tools.create_initial_state(device=device, dtype=torch.bfloat16)
+        target_seq_len = target_clean_state.latent.shape[1]
+
+        # Combined (reference + target). Reference tokens are clean: denoise_mask = 0.
+        ref_denoise_mask = torch.zeros(1, ref_seq_len, 1, device=device, dtype=torch.float32)
+        combined_clean_state = LatentState(
+            latent=torch.cat([ref_tokens, target_clean_state.latent], dim=1),
+            denoise_mask=torch.cat([ref_denoise_mask, target_clean_state.denoise_mask], dim=1),
+            positions=torch.cat([ref_positions, target_clean_state.positions], dim=2),
+            clean_latent=torch.cat([ref_tokens, target_clean_state.clean_latent], dim=1),
+        )
+
+        # Per-token slot ids: reference tokens -> image index, target tokens -> padding index.
+        target_slot_ids = torch.full(
+            (target_seq_len,), config.reference_slot_count, dtype=torch.long, device=device
+        )
+        reference_slot_ids = torch.cat([ref_slot_ids, target_slot_ids]).unsqueeze(0)  # [1, ref+target]
+
+        # Noise (GaussianNoiser only perturbs denoise_mask==1 tokens -> reference tokens stay clean).
+        noiser = GaussianNoiser(generator=generator)
+        combined_state = noiser(latent_state=combined_clean_state, noise_scale=1.0)
+
+        audio_tools = self._create_audio_latent_tools(config) if config.generate_audio else None
+        audio_clean_state = (
+            audio_tools.create_initial_state(device=device, dtype=torch.bfloat16) if audio_tools else None
+        )
+        audio_state = noiser(latent_state=audio_clean_state, noise_scale=1.0) if audio_clean_state else None
+
+        combined_state, audio_state = self._run_denoising(
+            config=config,
+            video_state=combined_state,
+            audio_state=audio_state,
+            video_clean_state=combined_clean_state,
+            audio_clean_state=audio_clean_state,
+            v_ctx_pos=v_ctx_pos,
+            a_ctx_pos=a_ctx_pos,
+            v_ctx_neg=v_ctx_neg,
+            a_ctx_neg=a_ctx_neg,
+            device=device,
+            video_reference_slot_ids=reference_slot_ids,
+            video_ref_seq_len=ref_seq_len,
+        )
+
+        # Decode only the target portion (reference tokens excluded).
+        target_latent = combined_state.latent[:, ref_seq_len:]
+        video_output = self._decode_video_latent(target_latent, config, device)
+
+        audio_output = None
+        if audio_state is not None and audio_tools is not None:
+            audio_state = audio_tools.clear_conditioning(audio_state)
+            audio_state = audio_tools.unpatchify(audio_state)
+            audio_output = self._decode_audio(audio_state, device)
+
+        return video_output, audio_output
+
+    def _encode_reference_images(
+        self, images: list[Tensor], config: GenerationConfig, device: torch.device
+    ) -> tuple[Tensor, Tensor, Tensor, int]:
+        """Encode K reference images -> (ref_tokens [1, sum_k hw_k, C], positions [1,3,sum_k hw_k,2],
+        slot_ids [sum_k hw_k], ref_seq_len). Replicates process_reference_images.py preprocessing.
+
+        Two modes (MUST match how the model was trained):
+          - square (v1, default): cover-crop each image to reference_resolution^2, identical token count.
+          - bucketed (v2, reference_bucketed=True): nearest-aspect bucket per image (16:9/9:16/square),
+            so per-image token counts vary -> images encoded individually and concatenated.
+        """
+        from torchvision.transforms import InterpolationMode
+        from torchvision.transforms.functional import resize
+
+        # Aspect buckets (W, H) — keep in sync with process_reference_images.py REF_BUCKETS.
+        REF_BUCKETS = {"landscape": (1376, 768), "portrait": (768, 1376), "square": (768, 768)}
+
+        def _bucket_for(w: int, h: int) -> tuple[int, int]:
+            ar = w / h
+            if ar >= 1.3:
+                return REF_BUCKETS["landscape"]
+            if ar <= 1 / 1.3:
+                return REF_BUCKETS["portrait"]
+            return REF_BUCKETS["square"]
+
+        def _cover_crop(img: Tensor, th: int, tw: int) -> Tensor:
+            _, h, w = img.shape
+            scale = max(th / h, tw / w)
+            nh, nw = max(round(h * scale), th), max(round(w * scale), tw)
+            t = resize(img, [nh, nw], interpolation=InterpolationMode.BICUBIC, antialias=True)
+            top, left = (nh - th) // 2, (nw - tw) // 2
+            return t[:, top : top + th, left : left + tw]
+
+        # Resize each image to its target (square or aspect bucket), in [-1, 1].
+        processed: list[Tensor] = []  # each [C, th, tw]
+        for img in images:  # img: [C, H, W] in [0, 1]
+            _, h, w = img.shape
+            if config.reference_bucketed:
+                tw, th = _bucket_for(w, h)
+            else:
+                th = tw = config.reference_resolution
+            processed.append(_cover_crop(img, th, tw) * 2.0 - 1.0)
+
+        self._vae_encoder.to(device)
+        # Encode each image individually (buckets differ in size, so no batched stack).
+        token_parts: list[Tensor] = []
+        position_parts: list[Tensor] = []
+        slot_parts: list[Tensor] = []
+        with torch.autocast(device_type=str(device).split(":")[0], dtype=torch.bfloat16):
+            for k, t in enumerate(processed):
+                video = t.unsqueeze(0).unsqueeze(2).to(device=device, dtype=torch.float32)  # [1, C, 1, th, tw]
+                lat = self._vae_encoder(video).to(torch.bfloat16)  # [1, C_lat, 1, h, w]
+                tok = self._video_patchifier.patchify(lat)  # [1, hw, C]
+                hw = tok.shape[1]
+                token_parts.append(tok)
+
+                latent_shape = VideoLatentShape(
+                    batch=1, channels=lat.shape[1], frames=1, height=lat.shape[3], width=lat.shape[4]
+                )
+                coords = self._video_patchifier.get_patch_grid_bounds(output_shape=latent_shape, device=device)
+                pos = get_pixel_coords(coords, scale_factors=VIDEO_SCALE_FACTORS, causal_fix=True).to(torch.bfloat16)
+                if config.reference_time_per_image:
+                    # exp2c/d: image-k gets a distinct RoPE time base + step*k (identity carried by time).
+                    pos[:, 0, ...] = config.reference_time_base + config.reference_time_step * k
+                else:
+                    pos[:, 0, ...] = config.reference_time_constant  # shared time (identity via embedding)
+                position_parts.append(pos)  # [1, 3, hw, 2]
+                slot_parts.append(torch.full((hw,), k, device=device, dtype=torch.long))
+        self._vae_encoder.to("cpu")
+
+        ref_tokens = torch.cat(token_parts, dim=1)  # [1, sum_k hw_k, C]
+        ref_positions = torch.cat(position_parts, dim=2)  # [1, 3, sum_k hw_k, 2]
+        ref_slot_ids = torch.cat(slot_parts, dim=0)  # [sum_k hw_k]
+        return ref_tokens, ref_positions, ref_slot_ids, ref_tokens.shape[1]
 
     def _create_video_latent_tools(self, config: GenerationConfig) -> VideoLatentTools:
         """Create video latent tools for the given configuration."""
@@ -486,13 +657,26 @@ class ValidationSampler:
         v_ctx_neg: Tensor | None,
         a_ctx_neg: Tensor | None,
         device: torch.device,
+        video_reference_slot_ids: Tensor | None = None,
+        video_ref_seq_len: int = 0,
     ) -> tuple[LatentState, LatentState | None]:
-        """Run the denoising loop using X0 prediction with CFG and optional STG."""
+        """Run the denoising loop using X0 prediction with CFG, optional STG and optional reference CFG.
+
+        `video_reference_slot_ids` (exp2): per-token reference-image slot ids for the video modality;
+        set once on the initial Modality and preserved by every `replace()` in the loop, so the model
+        adds the per-image identity embedding to the reference tokens on each forward pass.
+
+        `video_ref_seq_len` (exp2): number of leading in-context reference tokens in the video sequence.
+        When `config.ref_guidance_scale != 1.0`, an extra ref-less pass runs per step (same positive text,
+        same STG-free forward, reference tokens REMOVED from the sequence — matching the training-time
+        dropout null) and the CFG delta is applied on the target slice only.
+        """
         scheduler = LTX2Scheduler()
         sigmas = scheduler.execute(steps=config.num_inference_steps).to(device).float()
         stepper = EulerDiffusionStep()
         cfg_guider = CFGGuider(config.guidance_scale)
         stg_guider = STGGuider(config.stg_scale)
+        ref_guider = CFGGuider(config.ref_guidance_scale)
 
         # Build STG perturbation config if STG is enabled
         stg_perturbation_config = self._build_stg_perturbation_config(config) if stg_guider.enabled() else None
@@ -506,6 +690,7 @@ class ValidationSampler:
             positions=video_state.positions,
             context=v_ctx_pos,
             context_mask=None,
+            reference_slot_ids=video_reference_slot_ids,
         )
 
         # Audio modality is None when not generating audio
@@ -558,6 +743,32 @@ class ValidationSampler:
                     denoised_video = denoised_video + cfg_guider.delta(pos_video, neg_video)
                     if audio is not None and denoised_audio is not None:
                         denoised_audio = denoised_audio + cfg_guider.delta(pos_audio, neg_audio)
+
+                # Apply reference CFG if ref_guidance_scale != 1.0 (ref-less pass: positive text,
+                # reference tokens removed -> shorter sequence; delta on the target slice only).
+                if ref_guider.enabled() and video_ref_seq_len > 0:
+                    rsl = video_ref_seq_len
+                    video_refless = replace(
+                        video,
+                        latent=video.latent[:, rsl:],
+                        timesteps=video.timesteps[:, rsl:],
+                        positions=video.positions[:, :, rsl:, :],
+                        reference_slot_ids=(
+                            video.reference_slot_ids[:, rsl:] if video.reference_slot_ids is not None else None
+                        ),
+                        attention_mask=(
+                            video.attention_mask[:, rsl:, rsl:] if video.attention_mask is not None else None
+                        ),
+                    )
+                    refless_video, refless_audio = x0_model(video=video_refless, audio=audio, perturbations=None)
+                    # Pad the target-slice delta with zeros over the (clean, clamped) reference region;
+                    # no in-place mutation, pos_video stays intact for the STG delta below.
+                    ref_delta = ref_guider.delta(pos_video[:, rsl:], refless_video)
+                    denoised_video = denoised_video + torch.cat(
+                        [torch.zeros_like(denoised_video[:, :rsl]), ref_delta], dim=1
+                    )
+                    if audio is not None and denoised_audio is not None and refless_audio is not None:
+                        denoised_audio = denoised_audio + ref_guider.delta(pos_audio, refless_audio)
 
                 # Apply STG if stg_scale != 0.0
                 if stg_guider.enabled() and stg_perturbation_config is not None:
@@ -677,6 +888,16 @@ class ValidationSampler:
             raise ValueError("Image conditioning requires vae_encoder")
         if config.reference_video is not None and self._vae_encoder is None:
             raise ValueError("Reference video conditioning requires vae_encoder")
+        if config.reference_images is not None:
+            if self._vae_encoder is None:
+                raise ValueError("Reference-image conditioning requires vae_encoder")
+            if len(config.reference_images) == 0:
+                raise ValueError("reference_images was provided but empty")
+            if len(config.reference_images) > config.reference_slot_count:
+                raise ValueError(
+                    f"{len(config.reference_images)} reference images exceeds reference_slot_count "
+                    f"({config.reference_slot_count})"
+                )
 
         # Validate prompt embedding source
         if config.cached_embeddings is None and self._text_encoder is None:

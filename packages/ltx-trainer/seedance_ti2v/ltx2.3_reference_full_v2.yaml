@@ -1,0 +1,96 @@
+# =============================================================================
+# exp2 v2: higher-resolution reference->video — FULL fine-tune (FSDP) + dropout
+# =============================================================================
+# Same recipe as exp2e (learned identity embedding, shared ref time -1.0,
+# reference_dropout_p 0.1 for ref-CFG) EXCEPT it trains on the v2 precompute root:
+#   - VIDEO latents at 1280x704 (latent 40x22), up from v1's 768x448 (24x14) -> ~2.6x tokens
+#   - REFERENCE latents aspect-bucketed (16:9->1376x768, 9:16->768x1376, other->768x768),
+#     replacing v1's fixed-512 square crop that chopped ~44% off tall refs.
+# Text conditions + audio latents are symlinked from v1 (resolution-independent).
+#
+# NOTE: ~2.6x video tokens + larger refs -> heavier step. Gradient checkpointing on;
+# consider HSDP multi-node (configs/accelerate/fsdp_hsdp.yaml) for throughput.
+# =============================================================================
+
+model:
+  model_path: "/home/zheng/videogen/checkpoints/LTX-2.3/ltx-2.3-22b-dev.safetensors"
+  text_encoder_path: "/home/zheng/videogen/checkpoints/gemma-3-12b-it-qat-q4_0-unquantized"
+  training_mode: "full"
+  # RESUME the 4-node run (job 891) from its last checkpoint (step 28000); continues into the same
+  # output_dir. Set back to null for a fresh run. Optimizer state not saved (minimal) -> Adam resets.
+  load_checkpoint: "/home/zheng/seedance_video_v0/runs/ltx2.3_reference_full_v2/checkpoints/model_weights_step_28000.safetensors"
+
+lora: null
+
+training_strategy:
+  name: "reference_images"
+  reference_latents_dir: "reference_image_latents"
+  max_reference_slots: 9
+  reference_time_constant: -1.0
+  reference_embedding_type: "learned"
+  reference_dropout_p: 0.1         # 10% of samples drop ALL refs (trains ref-uncond branch for ref-CFG)
+  reference_image_dropout_p: 0.0
+  first_frame_conditioning_p: 0.0
+  with_audio: true
+  audio_latents_dir: "audio_latents"
+
+optimization:
+  learning_rate: 2.0e-5          # sqrt(4) x single-node 1e-5 for the 4x global batch (32), matches b4n
+  steps: 50000                   # high cap; constant LR (no decay) so this only raises the ceiling -> pick best ckpt offline
+  batch_size: 1                  # required: variable-length multi-bucket + per-clip ref counts
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "constant"
+  scheduler_params: {}
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: null
+  load_text_encoder_in_8bit: false
+  offload_optimizer_during_validation: false
+
+data:
+  preprocessed_data_root: "/home/zheng/seedance_video_v0/.precomputed_ti2v_16x9_v2"
+  num_dataloader_workers: 4
+
+validation:
+  interval: null
+  prompts: []
+  negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
+  images: null
+  video_dims: [1280, 704, 121]
+  frame_rate: 24.0
+  seed: 42
+  inference_steps: 30
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_av"
+  generate_audio: false
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 500
+  keep_last_n: -1
+  precision: "bfloat16"
+  save_training_state: "minimal"
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: true
+  project: "ltx2.3-seedance-ref"
+  entity: null
+  tags: ["ltx2.3", "reference", "full", "seedance", "dropout", "v2", "hires"]
+  log_validation_videos: true
+
+seed: 42
+output_dir: "/home/zheng/seedance_video_v0/runs/ltx2.3_reference_full_v2"
